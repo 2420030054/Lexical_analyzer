@@ -1,0 +1,456 @@
+CFG Ambiguity Detector
+=======================
+A practical, bounded-effort tool for flagging likely ambiguity in a
+context-free grammar (CFG).
+
+Since ambiguity detection for arbitrary CFGs is undecidable in general,
+this tool combines two complementary techniques instead of trying to give
+a single yes/no verdict:
+
+1. Static overlap check (fast, heuristic)
+   Compares the FIRST sets of a nonterminal's alternatives. Overlapping
+   FIRST sets often (not always) signal a parsing conflict.
+
+2. Bounded derivation analysis (slower, concrete evidence)
+   Generates sample strings up to a configurable depth/length, parses
+   each one with a generalized CYK-style recognizer, and counts how many
+   distinct parse trees exist for it. A string with more than one valid
+   parse tree is a concrete *witness* of ambiguity -- proof, not a guess.
+
+Grammar file format (plain text):
+
+    E -> E + T | T
+    T -> T * F | F
+    F -> ( E ) | id
+
+- The symbol on the left of the first rule is the start symbol.
+- Anything that appears on the left of an arrow is a nonterminal.
+- Everything else is a terminal (tokens are whitespace-separated).
+- Alternatives are separated by '|'.
+- Use 'eps' (or leave an alternative blank) for an empty production.
+"""
+
+from future import annotations
+from dataclasses import dataclass, field
+from itertools import product
+from typing import Dict, List, Tuple, Set, Optional
+import itertools
+import sys
+
+Symbol = str
+Production = Tuple[Symbol, ...]   # right-hand side, as a tuple of symbols
+
+EPSILON = "eps"
+
+
+# --------------------------------------------------------------------------
+# Grammar representation
+# --------------------------------------------------------------------------
+
+@dataclass
+class Grammar:
+    start: Symbol
+    rules: Dict[Symbol, List[Production]] = field(default_factory=dict)
+
+    @property
+    def nonterminals(self) -> Set[Symbol]:
+        return set(self.rules.keys())
+
+    def terminals(self) -> Set[Symbol]:
+        terms = set()
+        for prods in self.rules.values():
+            for rhs in prods:
+                for sym in rhs:
+                    if sym not in self.rules and sym != EPSILON:
+                        terms.add(sym)
+        return terms
+
+    @staticmethod
+    def from_text(text: str) -> "Grammar":
+        rules: Dict[Symbol, List[Production]] = {}
+        start: Optional[Symbol] = None
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "->" not in line:
+                raise ValueError(f"Malformed rule (missing '->'): {raw_line!r}")
+            lhs, rhs = line.split("->", 1)
+            lhs = lhs.strip()
+            if start is None:
+                start = lhs
+            alts = [alt.strip() for alt in rhs.split("|")]
+            prods = []
+            for alt in alts:
+                if alt == "" or alt == EPSILON:
+                    prods.append((EPSILON,))
+                else:
+                    prods.append(tuple(alt.split()))
+            rules.setdefault(lhs, []).extend(prods)
+        if start is None:
+            raise ValueError("Grammar text contained no rules.")
+        return Grammar(start=start, rules=rules)
+
+    def alternatives(self, nt: Symbol) -> List[Production]:
+        return self.rules.get(nt, [])
+
+
+# --------------------------------------------------------------------------
+# 1. Static overlap check (FIRST-set heuristic)
+# --------------------------------------------------------------------------
+
+def compute_first_sets(g: Grammar) -> Dict[Symbol, Set[Symbol]]:
+    first: Dict[Symbol, Set[Symbol]] = {nt: set() for nt in g.nonterminals}
+    changed = True
+    while changed:
+        changed = False
+        for nt, prods in g.rules.items():
+            for rhs in prods:
+                nullable_prefix = True
+                for sym in rhs:
+                    if sym == EPSILON:
+                        if EPSILON not in first[nt]:
+                            first[nt].add(EPSILON)
+                            changed = True
+break
+                    if sym not in g.rules:  # terminal
+                        if sym not in first[nt]:
+                            first[nt].add(sym)
+                            changed = True
+                        nullable_prefix = False
+                        break
+                    else:  # nonterminal
+                        before = len(first[nt])
+                        first[nt] |= (first[sym] - {EPSILON})
+                        if len(first[nt]) != before:
+                            changed = True
+                        if EPSILON not in first[sym]:
+                            nullable_prefix = False
+                            break
+                if nullable_prefix and (not rhs or rhs[-1] != EPSILON):
+                    if EPSILON not in first[nt]:
+                        first[nt].add(EPSILON)
+                        changed = True
+    return first
+
+
+def static_overlap_report(g: Grammar) -> List[str]:
+    """Flag nonterminals whose alternatives share FIRST-set symbols."""
+    first = compute_first_sets(g)
+    findings = []
+    for nt, prods in g.rules.items():
+        alt_firsts = []
+        for rhs in prods:
+            s = set()
+            for sym in rhs:
+                if sym == EPSILON:
+                    s.add(EPSILON)
+                    break
+                if sym not in g.rules:
+                    s.add(sym)
+                    break
+                else:
+                    s |= (first[sym] - {EPSILON})
+                    if EPSILON not in first[sym]:
+                        break
+            alt_firsts.append(s)
+        for i, j in itertools.combinations(range(len(prods)), 2):
+            overlap = alt_firsts[i] & alt_firsts[j]
+            if overlap:
+                findings.append(
+                    f"{nt}: alternatives {' '.join(prods[i]) or 'eps'!r} and "
+                    f"{' '.join(prods[j]) or 'eps'!r} share FIRST symbols {sorted(overlap)}"
+                )
+    return findings
+
+
+# --------------------------------------------------------------------------
+# 2. Bounded derivation analysis: sample generation + parse-forest counting
+# --------------------------------------------------------------------------
+
+def generate_sample_strings(g: Grammar, max_depth: int, max_len: int,
+                             cap: int = 300) -> List[List[Symbol]]:
+    """
+    Breadth-first expansion of the start symbol up to max_depth derivation
+    steps, keeping only fully-terminal strings no longer than max_len.
+    Capped so this stays a 'bounded-effort' technique on recursive grammars.
+    """
+    results: List[List[Symbol]] = []
+    seen: Set[Tuple[Symbol, ...]] = set()
+    frontier: List[List[Symbol]] = [[g.start]]
+
+    def record_if_terminal(form: List[Symbol]) -> bool:
+        """Returns True and stores the string if form has no nonterminals left."""
+        if any(s in g.rules for s in form):
+            return False
+        terminal_form = tuple(s for s in form if s != EPSILON)
+        if len(terminal_form) <= max_len and terminal_form not in seen:
+            seen.add(terminal_form)
+            results.append(list(terminal_form))
+        return True
+
+    record_if_terminal(frontier[0])  # covers a start symbol with an eps production
+
+    for _ in range(max_depth):
+        next_frontier: List[List[Symbol]] = []
+        for form in frontier:
+            idx = next((i for i, s in enumerate(form) if s in g.rules), None)
+            if idx is None:
+                continue  # already recorded when it was produced, below
+            nt = form[idx]
+            for rhs in g.alternatives(nt):
+                new_form = form[:idx] + list(rhs) + form[idx + 1:]
+                if len([s for s in new_form if s != EPSILON]) > max_len:
+                    continue
+                # Check right away -- waiting for the *next* round to notice
+                # a form is fully terminal drops anything completed on the
+                # very last round of the search.
+                if not record_if_terminal(new_form):
+                    next_frontier.append(new_form)
+            if
+len(results) >= cap:
+                return results[:cap]
+        frontier = next_frontier[: cap * 4]
+        if not frontier:
+            break
+    return results[:cap]
+
+
+def derivable_table(g: Grammar, tokens: List[Symbol]):
+    """
+    Generalized-CYK style recognizer for arbitrary CFGs (not just Chomsky
+    normal form). Builds derivable[(nt, i, j)] = True if nt can generate
+    tokens[i:j]. Handles unit-production cycles via fixed-point iteration
+    within each span length.
+    """
+    n = len(tokens)
+    derivable: Dict[Tuple[Symbol, int, int], bool] = {}
+
+    def matches_symbol(sym: Symbol, i: int, j: int) -> bool:
+        if sym == EPSILON:
+            return i == j
+        if sym not in g.rules:  # terminal
+            return j == i + 1 and tokens[i] == sym
+        return derivable.get((sym, i, j), False)
+
+    def rhs_matches(rhs: Production, i: int, j: int) -> bool:
+        rhs = tuple(s for s in rhs if s != EPSILON)
+        if not rhs:
+            return i == j
+        k = len(rhs)
+        # try every way to split [i, j) into k consecutive parts
+        def rec(pos: int, sym_idx: int, start: int) -> bool:
+            if sym_idx == k:
+                return pos == j
+            for end in range(pos, j + 1):
+                if matches_symbol(rhs[sym_idx], pos, end) and rec(end, sym_idx + 1, start):
+                    return True
+            return False
+        return rec(i, 0, i)
+
+    for length in range(0, n + 1):
+        for i in range(0, n - length + 1):
+            j = i + length
+            changed = True
+            while changed:
+                changed = False
+                for nt, prods in g.rules.items():
+                    if derivable.get((nt, i, j)):
+                        continue
+                    for rhs in prods:
+                        if rhs_matches(rhs, i, j):
+                            derivable[(nt, i, j)] = True
+                            changed = True
+                            break
+    return derivable
+
+
+def count_parse_trees(g: Grammar, tokens: List[Symbol],
+                       derivable, cap: int = 3) -> List[str]:
+    """
+    Enumerate up to cap distinct parse trees (as bracketed strings) for
+    the full token string under the start symbol.
+
+    Memoized on (symbol, i, j): each subspan's trees are computed once and
+    reused across every parent context that needs them. Without this, the
+    same subtree gets re-derived from scratch by every ambiguous parent
+    path, which turns a small bounded search into an exponential one and
+    blows the call stack on anything but a trivial grammar. The memo also
+    doubles as a cycle guard for unit-production loops (A -> B -> A over
+    the same span): a key is seeded with [] before it is solved, so a
+    cyclic reference sees "no trees yet" instead of recursing forever.
+    """
+    n = len(tokens)
+    memo: Dict[Tuple[Symbol, int, int], List[str]] = {}
+
+    def build(sym: Symbol, i: int, j: int) -> List[str]:
+        key = (sym, i, j)
+        if key in memo:
+            return memo[key]
+        if sym == EPSILON:
+            return ["\u03b5"] if i == j else []
+        if sym not in g.rules:
+            return [sym] if (j == i + 1 and i < n and tokens[i] == sym) else []
+
+        memo[key] = []  # cycle guard: seed before recursing
+        trees: List[str] = []
+
+        def splits(pos: int, idx: int, clean: Production) -> List[List[str]]:
+            if idx == len(clean):
+                return [[]] if pos == j else []
+            sym_k = clean[idx]
+            results: List[List[str]] = []
+            for end in range(pos, j + 1):
+                if sym_k in g.rules:
+                    if not derivable.get((sym_k, pos, end)):
+                        continue
+                else:
+                    if not (end == pos + 1 and pos < n and tokens[pos] == sym_k):
+                        continue
+                sub_trees = build(sym_k, pos, end)
+                if not sub_trees:
+                    continue
+                rest = splits(end, idx + 1, clean)
+                for r in rest:
+                    for st in
+sub_trees:
+                        results.append([st] + r)
+                        if len(results) >= cap:
+                            return results
+                if len(results) >= cap:
+                    return results
+            return results
+
+        for rhs in g.alternatives(sym):
+            clean = tuple(s for s in rhs if s != EPSILON)
+            if not clean:
+                if i == j:
+                    trees.append(f"({sym} \u03b5)")
+                    if len(trees) >= cap:
+                        break
+                continue
+            for combo in splits(i, 0, clean):
+                trees.append(f"({sym} " + " ".join(combo) + ")")
+                if len(trees) >= cap:
+                    break
+            if len(trees) >= cap:
+                break
+
+        memo[key] = trees
+        return trees
+
+    return build(g.start, 0, n)
+
+
+def find_ambiguity_witnesses(g: Grammar, max_depth: int = 6, max_len: int = 6,
+                              sample_cap: int = 150, tree_cap: int = 3):
+    witnesses = []
+    samples = generate_sample_strings(g, max_depth, max_len, cap=sample_cap)
+    for tokens in samples:
+        table = derivable_table(g, tokens)
+        if not table.get((g.start, 0, len(tokens))):
+            continue  # shouldn't happen since it was derived, but guard anyway
+        trees = count_parse_trees(g, tokens, table, cap=tree_cap)
+        if len(trees) > 1:
+            witnesses.append((tokens, trees))
+    return witnesses
+
+
+# --------------------------------------------------------------------------
+# 3. Lightweight disambiguation suggestions
+# --------------------------------------------------------------------------
+
+def suggest_fixes(g: Grammar, witnesses) -> List[str]:
+    suggestions = []
+    for nt, prods in g.rules.items():
+        infix_ops = []
+        for rhs in prods:
+            if len(rhs) == 3 and rhs[0] == nt and rhs[2] == nt and rhs[1] not in g.rules:
+                infix_ops.append(rhs[1])
+        if len(infix_ops) >= 2:
+            suggestions.append(
+                f"{nt}: multiple infix alternatives ({', '.join(infix_ops)}) directly "
+                f"recurse on both sides. Consider splitting {nt} into separate "
+                f"precedence levels (e.g. one nonterminal per operator group) and "
+                f"fixing associativity (left-recurse OR right-recurse, not both) "
+                f"instead of '{nt} -> {nt} op {nt}'."
+            )
+    if witnesses:
+        suggestions.append(
+            "For each witness string above, compare the printed parse trees: "
+            "the point where they first diverge is the exact production causing "
+            "the conflict -- factor that alternative out or add a precedence rule there."
+        )
+    return suggestions
+
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+
+def analyze(grammar_text: str, max_depth: int = 6, max_len: int = 6) -> None:
+    g = Grammar.from_text(grammar_text)
+    print(f"Start symbol: {g.start}")
+    print(f"Nonterminals: {sorted(g.nonterminals)}")
+    print(f"Terminals:    {sorted(g.terminals())}\n")
+
+    print("== Static overlap check (heuristic) ==")
+    overlaps = static_overlap_report(g)
+    if overlaps:
+        for line in overlaps:
+            print(" -", line)
+    else:
+        print(" No overlapping FIRST sets found.")
+    print()
+
+    print(f"== Bounded derivation analysis (depth<={max_depth}, len<={max_len}) ==")
+    witnesses = find_ambiguity_witnesses(g, max_depth=max_depth, max_len=max_len)
+    if witnesses:
+        print(f" Found {len(witnesses)} ambiguous witness string(s):\n")
+        for tokens, trees in witnesses[:10]:
+            print("  String: " + " ".join(tokens))
+            for t in trees:
+                print("    parse:", t)
+            print()
+    else:
+        print(" No ambiguity witnesses found within the bounded search "
+              "(this does not prove the grammar is unambiguous).")
+    print()
+
+    print("== Suggestions ==")
+suggestions = suggest_fixes(g, witnesses)
+    if suggestions:
+        for s in suggestions:
+            print(" -", s)
+    else:
+        print(" No automatic suggestions triggered.")
+
+
+# --------------------------------------------------------------------------
+# Demo
+# --------------------------------------------------------------------------
+
+if name == "__main__":
+    if len(sys.argv) > 1:
+        with open(sys.argv[1]) as f:
+            analyze(f.read())
+        sys.exit(0)
+
+    print("#" * 70)
+    print("# Demo 1: the project's own grammar (precedence-climbing, unambiguous)")
+    print("#" * 70)
+    unambiguous_grammar = """
+    E -> E + T | T
+    T -> T * F | F
+    F -> ( E ) | id
+    """
+    analyze(unambiguous_grammar, max_depth=8, max_len=5)
+
+    print("\n\n")
+    print("#" * 70)
+    print("# Demo 2: a deliberately ambiguous grammar")
+    print("#" * 70)
+    ambiguous_grammar = """
+    E -> E + E | E * E | id
+    """
+    analyze(ambiguous_grammar, max_depth=5, max_len=5)
